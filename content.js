@@ -198,12 +198,54 @@
       classHits[pattern] = document.querySelectorAll(`[class*="${pattern}"]`).length;
     });
 
-    return {
+    const diagnostics = {
       url: location.href,
       dataTestIds: Array.from(testIds).slice(0, 50),
       classPatternCounts: classHits,
       bodyChildCount: document.body ? document.body.children.length : 0,
     };
+
+    // Claude Code web sessions (claude.ai/code/session_...) use a
+    // virtualized transcript list (data-testid="transcript-row") instead
+    // of the plain-DOM chat layout. Extraction there needs an auto-scroll
+    // capture routine, which needs real row markup + the scroll container
+    // to be built correctly. Capture that here so one failed export run
+    // gives us everything needed to add support, instead of guessing.
+    const transcriptRows = document.querySelectorAll('[data-testid="transcript-row"]');
+    if (transcriptRows.length > 0) {
+      const sampleRows = Array.from(transcriptRows)
+        .slice(0, 3)
+        .map((el) => el.outerHTML.slice(0, 2000));
+
+      let scrollContainer = null;
+      let node = transcriptRows[0].parentElement;
+      while (node && node !== document.body) {
+        const style = window.getComputedStyle(node);
+        const scrollable =
+          (style.overflowY === "auto" || style.overflowY === "scroll") &&
+          node.scrollHeight > node.clientHeight;
+        if (scrollable) {
+          scrollContainer = {
+            tag: node.tagName.toLowerCase(),
+            className: node.className,
+            testId: node.getAttribute("data-testid"),
+            scrollHeight: node.scrollHeight,
+            clientHeight: node.clientHeight,
+            scrollTop: node.scrollTop,
+          };
+          break;
+        }
+        node = node.parentElement;
+      }
+
+      diagnostics.codeSessionTranscript = {
+        rowCountCurrentlyInDom: transcriptRows.length,
+        sampleRowOuterHtml: sampleRows,
+        scrollContainer,
+      };
+    }
+
+    return diagnostics;
   }
 
   // ==========================================================================
