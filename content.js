@@ -6,6 +6,12 @@
 (() => {
   "use strict";
 
+  // Bump this string whenever content.js changes. Logged on load and
+  // included in diagnostics so a stale/cached injection is obvious
+  // instead of silently producing confusing partial results.
+  const CONTENT_SCRIPT_VERSION = "2026-08-20-v3-code-session-inspect";
+  console.log("[Claude Conversation Exporter] content.js loaded — version", CONTENT_SCRIPT_VERSION);
+
   // ==========================================================================
   // DOM EXTRACTION LOGIC — CLAUDE.AI SPECIFIC
   // ==========================================================================
@@ -199,6 +205,7 @@
     });
 
     const diagnostics = {
+      contentScriptVersion: CONTENT_SCRIPT_VERSION,
       url: location.href,
       dataTestIds: Array.from(testIds).slice(0, 50),
       classPatternCounts: classHits,
