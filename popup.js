@@ -44,7 +44,7 @@ function describeError(error) {
 exportBtn.addEventListener("click", async () => {
   diagBox.style.display = "none";
   exportBtn.disabled = true;
-  setStatus("Reading conversation…", "info");
+  setStatus("Reading conversation… (scrolling through the full thread — long conversations can take several seconds)", "info");
 
   try {
     const tab = await getActiveTab();

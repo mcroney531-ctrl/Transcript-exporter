@@ -9,7 +9,7 @@
   // Bump this string whenever content.js changes. Logged on load and
   // included in diagnostics so a stale/cached injection is obvious
   // instead of silently producing confusing partial results.
-  const CONTENT_SCRIPT_VERSION = "2026-08-25-v4-force-reinject";
+  const CONTENT_SCRIPT_VERSION = "2026-08-25-v5-virtualized-extraction";
   console.log("[Claude Conversation Exporter] content.js loaded — version", CONTENT_SCRIPT_VERSION);
 
   // claude.ai is a single-page app: manifest-declared content_scripts only
@@ -59,15 +59,20 @@
   // instead of exporting an empty or garbled file.
   // ==========================================================================
 
+  // Fallback only — see captureVirtualizedTranscript() below for the
+  // primary extraction path, confirmed live against claude.ai on
+  // 2026-08-25. This static list stays as a safety net for a page that,
+  // for whatever reason, doesn't have any [data-testid="transcript-row"]
+  // elements at all (layout change, or a surface we haven't seen).
   const EXTRACTION_STRATEGIES = [
     {
-      name: "data-testid user-message + font-claude-message",
+      name: "data-testid user-message + font-claude-response",
       userSelector: '[data-testid="user-message"]',
-      assistantSelector: ".font-claude-message",
+      assistantSelector: ".font-claude-response",
     },
     {
-      name: "font-user-message + font-claude-message classes",
-      userSelector: ".font-user-message",
+      name: "data-testid user-message + font-claude-message (older guess)",
+      userSelector: '[data-testid="user-message"]',
       assistantSelector: ".font-claude-message",
     },
     {
@@ -187,7 +192,166 @@
       .trim();
   }
 
-  function extractConversation() {
+  // Both claude.ai/chat/... and claude.ai/code/session_... virtualize the
+  // transcript: only rows currently scrolled into view exist in the DOM
+  // (confirmed live: at rest near the bottom of a 198-message thread, only
+  // 21 [data-testid="transcript-row"] elements existed; scrolling to top
+  // dropped that to a handful with a small tail buffer, and directly
+  // re-querying a mid-thread data-index after scrolling away returned
+  // null — rows are actually removed, not hidden). So extraction has to
+  // drive the scroll container from top to bottom, capturing each row as
+  // it renders and deduping by its data-index, rather than a single query.
+  const SCROLL_CONTAINER_SELECTOR = '[data-autoscroll-container="true"]';
+
+  function findScrollContainer(sampleRow) {
+    const explicit = document.querySelector(SCROLL_CONTAINER_SELECTOR);
+    if (explicit) return explicit;
+    // Fallback for a surface where the confirmed selector above doesn't
+    // apply (e.g. Code sessions, not yet directly confirmed): walk up from
+    // a row looking for the nearest genuinely scrollable ancestor.
+    let node = sampleRow && sampleRow.parentElement;
+    while (node && node !== document.body) {
+      const style = window.getComputedStyle(node);
+      const scrollable =
+        (style.overflowY === "auto" || style.overflowY === "scroll") &&
+        node.scrollHeight > node.clientHeight;
+      if (scrollable) return node;
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  // A row's role is given directly by data-perf-row ("human"/"assistant")
+  // — confirmed live, and more reliable than inferring from which child
+  // markers are present. Message text lives in different places per role:
+  // user text is inside [data-testid="user-message"]; assistant text is
+  // inside .standard-markdown (or .progressive-markdown while streaming,
+  // which shouldn't apply to a past conversation being exported) under
+  // .font-claude-response. nodeToMarkdown/extractTextFromElement already
+  // handle that inner markup generically (p/pre/ul/ol/etc).
+  function extractRowMessage(row) {
+    const roleAttr = row.getAttribute("data-perf-row");
+    let role;
+    if (roleAttr === "human") role = "user";
+    else if (roleAttr === "assistant") role = "assistant";
+    else return null; // unrecognized row shape — skip rather than mis-tag
+
+    const container =
+      role === "user"
+        ? row.querySelector('[data-testid="user-message"]') || row.querySelector('[data-cds="UserMessage"]')
+        : row.querySelector(".standard-markdown") ||
+          row.querySelector(".progressive-markdown") ||
+          row.querySelector(".font-claude-response");
+    if (!container) return null;
+
+    const text = extractTextFromElement(container);
+    if (!text) return null;
+
+    const indexAttr = row.getAttribute("data-index") ?? row.getAttribute("data-rs-index");
+    const index = indexAttr !== null ? Number(indexAttr) : null;
+    if (index === null || Number.isNaN(index)) return null;
+
+    return { role, text, index };
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function captureVirtualizedTranscript() {
+    const firstRow = document.querySelector('[data-testid="transcript-row"]');
+    const scrollContainer = findScrollContainer(firstRow);
+    if (!scrollContainer) {
+      return { success: false, error: "NO_SCROLL_CONTAINER", diagnostics: runDiagnostics() };
+    }
+
+    const originalScrollTop = scrollContainer.scrollTop;
+    const captured = new Map(); // data-index -> {role, text, index}
+    let expectedTotal = null;
+
+    function captureVisibleRows() {
+      document.querySelectorAll('[data-testid="transcript-row"]').forEach((row) => {
+        if (expectedTotal === null) {
+          const article = row.querySelector("[aria-setsize]");
+          if (article) {
+            const setSize = Number(article.getAttribute("aria-setsize"));
+            if (!Number.isNaN(setSize)) expectedTotal = setSize;
+          }
+        }
+        const msg = extractRowMessage(row);
+        if (!msg || captured.has(msg.index)) return;
+        captured.set(msg.index, msg);
+      });
+    }
+
+    scrollContainer.scrollTop = 0;
+    await sleep(200);
+    captureVisibleRows();
+
+    // Deliberately smaller than a full viewport so consecutive capture
+    // windows overlap — avoids skipping rows the virtualizer never
+    // rendered because a step jumped clean over them.
+    const stepSize = Math.max(150, Math.round(scrollContainer.clientHeight * 0.5));
+    let lastScrollTop = -1;
+    let stableIterations = 0;
+    const maxIterations = 300;
+
+    for (let i = 0; i < maxIterations; i++) {
+      if (expectedTotal !== null && captured.size >= expectedTotal) break;
+
+      scrollContainer.scrollTop += stepSize;
+      await sleep(150);
+      captureVisibleRows();
+
+      if (scrollContainer.scrollTop === lastScrollTop) {
+        stableIterations++;
+        if (stableIterations >= 3) break; // reached the bottom
+      } else {
+        stableIterations = 0;
+        lastScrollTop = scrollContainer.scrollTop;
+      }
+    }
+
+    // One more explicit pass pinned to the very bottom, in case the
+    // stepping loop overshot and stopped just short of it.
+    scrollContainer.scrollTop = scrollContainer.scrollHeight;
+    await sleep(200);
+    captureVisibleRows();
+
+    scrollContainer.scrollTop = originalScrollTop;
+
+    const messages = Array.from(captured.values())
+      .sort((a, b) => a.index - b.index)
+      .map(({ role, text }) => ({ role, text }));
+
+    return { success: true, messages, expectedTotal, capturedCount: messages.length };
+  }
+
+  async function extractConversation() {
+    const hasVirtualizedTranscript = document.querySelector('[data-testid="transcript-row"]') !== null;
+
+    if (hasVirtualizedTranscript) {
+      const captureResult = await captureVirtualizedTranscript();
+      if (!captureResult.success) return captureResult;
+
+      if (captureResult.messages.length === 0) {
+        return { success: false, error: "EMPTY_MESSAGES", diagnostics: runDiagnostics() };
+      }
+
+      const countNote =
+        captureResult.expectedTotal != null
+          ? ` (captured ${captureResult.capturedCount} of ${captureResult.expectedTotal})`
+          : ` (captured ${captureResult.capturedCount})`;
+
+      return {
+        success: true,
+        messages: captureResult.messages,
+        strategyUsed: "virtualized-scroll-capture" + countNote,
+        pageTitle: document.title,
+      };
+    }
+
+    // Non-virtualized fallback — see the EXTRACTION_STRATEGIES comment above.
     const located = locateMessages();
     if (!located) {
       return { success: false, error: "NO_MESSAGES_FOUND", diagnostics: runDiagnostics() };
@@ -258,24 +422,17 @@
         .map((el) => el.outerHTML.slice(0, 2000));
 
       let scrollContainer = null;
-      let node = transcriptRows[0].parentElement;
-      while (node && node !== document.body) {
-        const style = window.getComputedStyle(node);
-        const scrollable =
-          (style.overflowY === "auto" || style.overflowY === "scroll") &&
-          node.scrollHeight > node.clientHeight;
-        if (scrollable) {
-          scrollContainer = {
-            tag: node.tagName.toLowerCase(),
-            className: node.className,
-            testId: node.getAttribute("data-testid"),
-            scrollHeight: node.scrollHeight,
-            clientHeight: node.clientHeight,
-            scrollTop: node.scrollTop,
-          };
-          break;
-        }
-        node = node.parentElement;
+      const containerNode = findScrollContainer(transcriptRows[0]);
+      if (containerNode) {
+        scrollContainer = {
+          tag: containerNode.tagName.toLowerCase(),
+          className: containerNode.className,
+          testId: containerNode.getAttribute("data-testid"),
+          hasAutoscrollAttr: containerNode.hasAttribute("data-autoscroll-container"),
+          scrollHeight: containerNode.scrollHeight,
+          clientHeight: containerNode.clientHeight,
+          scrollTop: containerNode.scrollTop,
+        };
       }
 
       diagnostics.codeSessionTranscript = {
@@ -339,27 +496,41 @@
   function onExtractMessage(request, _sender, sendResponse) {
     if (request.action !== "EXTRACT_CONVERSATION") return;
 
-    const result = extractConversation();
-    if (!result.success) {
-      sendResponse(result);
-      return;
-    }
+    // Extraction now drives an auto-scroll capture loop (virtualized
+    // transcript), so it's async — this listener must return true to keep
+    // the message channel open for the eventual sendResponse below.
+    extractConversation()
+      .then((result) => {
+        if (!result.success) {
+          sendResponse(result);
+          return;
+        }
 
-    const content = request.format === "text" ? formatAsText(result) : formatAsMarkdown(result);
-    const ext = request.format === "text" ? "txt" : "md";
-    const titlePart = sanitizeFilenamePart(
-      result.pageTitle && result.pageTitle !== "Claude" ? result.pageTitle : "claude-conversation"
-    );
-    const dateStamp = new Date().toISOString().slice(0, 10);
-    const filename = `${titlePart}-${dateStamp}.${ext}`;
+        const content = request.format === "text" ? formatAsText(result) : formatAsMarkdown(result);
+        const ext = request.format === "text" ? "txt" : "md";
+        const titlePart = sanitizeFilenamePart(
+          result.pageTitle && result.pageTitle !== "Claude" ? result.pageTitle : "claude-conversation"
+        );
+        const dateStamp = new Date().toISOString().slice(0, 10);
+        const filename = `${titlePart}-${dateStamp}.${ext}`;
 
-    sendResponse({
-      success: true,
-      content,
-      filename,
-      messageCount: result.messages.length,
-      strategyUsed: result.strategyUsed,
-    });
+        sendResponse({
+          success: true,
+          content,
+          filename,
+          messageCount: result.messages.length,
+          strategyUsed: result.strategyUsed,
+        });
+      })
+      .catch((err) => {
+        sendResponse({
+          success: false,
+          error: "EXTRACTION_EXCEPTION",
+          diagnostics: { message: String((err && err.message) || err), stack: err && err.stack },
+        });
+      });
+
+    return true;
   }
 
   chrome.runtime.onMessage.addListener(onExtractMessage);
