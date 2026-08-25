@@ -20,7 +20,9 @@ Two things resolved since the sections below were written, most recent first:
 
 **Verified without live claude.ai access**, same approach as the chat-extraction verification below: a second synthetic fixture (headless Chromium via Playwright, not committed — scratchpad only) mimicking a Code-session virtualizer, including a marker row and assistant rows with interleaved tool-call buttons. The unmodified capture algorithm correctly skipped the marker row, preserved order/roles for all 40 real turns, and correctly reconstructed the tool-call/prose sequence for interleaved rows. Also reran the original chat fixture as a regression check — still 150/150 correct. As before, this validates the *algorithm*, not the real-site selectors directly (though those came from live inspection this time, not guesswork).
 
-**Next step:** real end-to-end test on both a real `claude.ai/chat/...` conversation and a real `claude.ai/code/session_...` conversation — click Export, confirm a file downloads with complete, correctly-ordered, correctly-formatted content on each. The chat path in particular still hasn't had an explicit "yes, the downloaded file was correct" confirmation from the user as of this update — worth checking that first since Code-session support was built on top of the same core capture loop.
+**Chat export confirmed working end-to-end by the user** ("that worked") on a real `claude.ai/chat/...` conversation, right after the Load-unpacked path fix above — the virtualized-scroll capture, formatting, and download all work on the primary target.
+
+**Next step:** the same end-to-end confirmation on a real `claude.ai/code/session_...` conversation — click Export there and confirm a file downloads with complete, correctly-ordered content, including that tool-call summaries and prose read sensibly together for turns that have both. This is the one thing in this update that's only been verified against the synthetic fixture, not the real site.
 
 ---
 
