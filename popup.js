@@ -55,13 +55,23 @@ exportBtn.addEventListener("click", async () => {
     }
 
     const format = getSelectedFormat();
+    // Always force-(re)inject content.js before messaging, rather than only
+    // on failure. claude.ai is a single-page app, so a tab can carry a
+    // content-script listener registered hours/days ago, from a much older
+    // version of this file, that keeps answering sendMessage successfully
+    // (so it never throws) even after content.js on disk has changed and
+    // the extension has been reloaded. Forcing an injection here guarantees
+    // the current on-disk code is what runs on every click; content.js
+    // itself guards against the resulting double-injection by replacing its
+    // own previous listener (see the version-guard at the top of that file).
     let response;
     try {
+      await ensureContentScriptInjected(tab.id);
       response = await sendExtractMessage(tab.id, format);
     } catch (e) {
-      // Content script probably wasn't injected yet (e.g. extension was
-      // just installed/reloaded on an already-open tab). Inject and retry.
-      await ensureContentScriptInjected(tab.id);
+      // Injection itself can fail on restricted pages (e.g. chrome:// or an
+      // extension gallery page slipped through the claude.ai check above).
+      // Fall back to messaging whatever content script may already be there.
       response = await sendExtractMessage(tab.id, format);
     }
 

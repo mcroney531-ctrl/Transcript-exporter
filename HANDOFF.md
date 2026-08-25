@@ -2,6 +2,29 @@
 
 Read this whole document into a fresh Claude Code session before continuing. It captures everything needed to pick this up cold: the goal, what's built, what's broken, and the exact next steps — no need to re-derive any of it.
 
+## Update (2026-08-25): stale-content-script mystery diagnosed and fixed (code-only, not yet browser-verified)
+
+The session that wrote everything below this line ran with **no live browser access** either, so this fix is reasoned from Chrome extension semantics, not confirmed against the real page. Verify it first (see "Next step" at the end of this section) before trusting anything past it.
+
+**Root cause, most likely:** two compounding bugs, both in the wiring, not in the DOM-extraction logic:
+
+1. `popup.js`'s old flow only called `chrome.scripting.executeScript` (force-inject fresh `content.js`) when `chrome.tabs.sendMessage` **threw** — i.e. only when literally no listener existed in the tab yet. claude.ai is a single-page app: the manifest's declarative `content_scripts` entry only runs once per real page load/navigation, and a long-lived tab keeps whatever content-script listener it registered back then across client-side route changes *and* across reloading the unpacked extension in `chrome://extensions`. So once a tab had any listener — even one from a much older `content.js` — `sendMessage` kept succeeding against it, the throw/catch fallback never fired, and the fresh on-disk code was never the thing answering. This matches every symptom logged below: pulls confirmed, extension reloaded, hard refreshes done, even a "brand-new" tab could still be showing this if the extension's own reload in `chrome://extensions` was itself lagging or hitting a duplicate install.
+2. Even a naive fix ("just always force-inject") wouldn't have been enough: injecting `content.js` a second time into the same page re-runs the whole IIFE, which would register a **second** `chrome.runtime.onMessage` listener without removing the first. Chrome invokes all listeners in a page for an incoming message, but only the first one to synchronously call `sendResponse` wins the reply — and that's the listener registered *earliest* (registration order), i.e. the stale one, every time.
+
+**Fix applied (commit after `30014f1`):**
+- `content.js` now stashes its message listener function on `window.__claudeExporterOnMessageListener` and, on each execution, removes any previous instance's listener before registering its own — so the most recently injected copy always wins the reply race.
+- `content.js` also now renders a small fixed-position on-page banner (bottom-right, auto-removes after 6s) showing `CONTENT_SCRIPT_VERSION`, as a visual confirmation that doesn't depend on DevTools console timing — this was explicitly suggested but untried in the original debugging trail below.
+- `popup.js` now **always** calls `ensureContentScriptInjected` (force re-injects `content.js` from disk) before every `sendExtractMessage`, instead of only on catch. The try/catch around the pair now exists only to fall back to messaging-without-injecting if injection itself fails (e.g. a restricted page slipped through the `claude.ai/` URL check).
+- `CONTENT_SCRIPT_VERSION` bumped to `2026-08-25-v4-force-reinject`.
+
+**Why this should make the diagnostics-version mystery moot going forward:** every Export click now guarantees the current on-disk `content.js` is what answers, regardless of tab age, prior injections, or how many times the extension has been reloaded. The `contentScriptVersion` field (and now the on-page banner) should always match what's actually in the repo from here on — no more "Remove + Load unpacked" ritual needed to get new code to run.
+
+**What this fix does NOT touch:** the actual DOM extraction logic (`EXTRACTION_STRATEGIES`, `locateMessages`, virtualized-list handling) is unchanged. It was never actually exercised against real, current code before now, so the original "concrete next steps" below (get real `codeSessionTranscript` diagnostics, identify user-vs-assistant row structure, build the auto-scroll capture loop) still stand — they just might finally be reachable now.
+
+**Next step for whoever has live browser access:** load the extension fresh (or just reload it once — the new force-reinject logic means a stale tab shouldn't matter anymore), open a real `claude.ai/chat/...` tab, click Export, and confirm (a) the on-page banner shows `2026-08-25-v4-force-reinject` and (b) if extraction still fails, the diagnostics JSON now has `contentScriptVersion` matching. If both hold, the stale-code problem is solved for good and it's safe to move straight to step 2 of "Concrete next steps" below (pull real `transcript-row` outerHTML and rewrite the extraction logic for the virtualized list). If the banner still doesn't show the new version even after this, that really does point back to a duplicate-install or wrong-directory `Load unpacked` problem — check `chrome://extensions` for more than one card matching this extension's name before anything else.
+
+---
+
 ## The goal
 
 A personal-use Chrome extension (Manifest V3, "Load unpacked" only, not published) that exports the current Claude.ai conversation — every message, both sides, in order — to a downloadable `.md` or `.txt` file. Why: the user runs very long multi-session projects in Claude.ai (a long-form article-drafting project is the driving example) and needs to hand off full raw context to a fresh chat once a conversation gets unwieldy. A manual "ask Claude to summarize" handoff loses fidelity (exact wording, exact quotes); a full raw transcript export doesn't.

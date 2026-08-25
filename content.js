@@ -9,8 +9,41 @@
   // Bump this string whenever content.js changes. Logged on load and
   // included in diagnostics so a stale/cached injection is obvious
   // instead of silently producing confusing partial results.
-  const CONTENT_SCRIPT_VERSION = "2026-08-20-v3-code-session-inspect";
+  const CONTENT_SCRIPT_VERSION = "2026-08-25-v4-force-reinject";
   console.log("[Claude Conversation Exporter] content.js loaded — version", CONTENT_SCRIPT_VERSION);
+
+  // claude.ai is a single-page app: manifest-declared content_scripts only
+  // run once per real page load, and a long-lived tab can outlive many
+  // extension reloads. popup.js now force-reinjects this file on every
+  // Export click (see ensureContentScriptInjected) so the on-disk code is
+  // always what runs — but that means this IIFE can execute more than once
+  // in the same page. Without a guard, each execution would register its
+  // own chrome.runtime.onMessage listener, and since Chrome delivers the
+  // response from whichever listener calls sendResponse first (registration
+  // order, called synchronously), the OLDEST listener would keep winning
+  // forever — the exact "updated code never seems to run" symptom this
+  // version marker was added to debug. So: remove any previous instance's
+  // listener before registering this one.
+  if (window.__claudeExporterOnMessageListener) {
+    chrome.runtime.onMessage.removeListener(window.__claudeExporterOnMessageListener);
+  }
+  window.__claudeExporterVersion = CONTENT_SCRIPT_VERSION;
+
+  // Impossible-to-miss visual confirmation of which version is live,
+  // independent of devtools console timing or the diagnostics JSON.
+  (function showVersionBanner() {
+    const existing = document.getElementById("__claude-exporter-version-banner");
+    if (existing) existing.remove();
+    const banner = document.createElement("div");
+    banner.id = "__claude-exporter-version-banner";
+    banner.textContent = `Exporter content.js: ${CONTENT_SCRIPT_VERSION}`;
+    banner.style.cssText =
+      "position:fixed;bottom:8px;right:8px;z-index:2147483647;" +
+      "background:#111;color:#0f0;font:11px/1.4 monospace;padding:4px 8px;" +
+      "border-radius:4px;opacity:0.85;pointer-events:none;";
+    document.documentElement.appendChild(banner);
+    setTimeout(() => banner.remove(), 6000);
+  })();
 
   // ==========================================================================
   // DOM EXTRACTION LOGIC — CLAUDE.AI SPECIFIC
@@ -303,7 +336,7 @@
     return lines.join("\n");
   }
 
-  chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  function onExtractMessage(request, _sender, sendResponse) {
     if (request.action !== "EXTRACT_CONVERSATION") return;
 
     const result = extractConversation();
@@ -327,5 +360,8 @@
       messageCount: result.messages.length,
       strategyUsed: result.strategyUsed,
     });
-  });
+  }
+
+  chrome.runtime.onMessage.addListener(onExtractMessage);
+  window.__claudeExporterOnMessageListener = onExtractMessage;
 })();
