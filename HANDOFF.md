@@ -2,6 +2,28 @@
 
 Read this whole document into a fresh Claude Code session before continuing. It captures everything needed to pick this up cold: the goal, what's built, what's broken, and the exact next steps — no need to re-derive any of it.
 
+## Update (2026-08-25, latest): real root cause of the stale-code mystery found, and Code-session extraction implemented
+
+Two things resolved since the sections below were written, most recent first:
+
+**The actual root cause of the "stale content script" mystery (from the very first version of this handoff) was simpler than anything guessed at the time**: `chrome://extensions` → Details → "Loaded from" showed `~\Transcript-exporter`, which resolved to a completely different folder (`C:\Users\Rone\Transcript-exporter`) than the one being `git pull`ed (`C:\Users\Trevor Newsome\Documents\Transcript-exporter`). Every reload was faithfully re-reading fresh files — just from a folder nothing ever pushed updates to. Fixed with a one-time **Remove extension** + **Load unpacked** pointed at the correct folder. The force-reinject/listener-guard fix documented below is still good practice and still shipped, but wasn't the actual blocker. **Manifest `version` is now bumped on every meaningful change** (currently `1.2.0`) specifically so this class of problem is instantly visible on the Details page going forward — if a reload doesn't change the version shown, the loaded-from path is wrong again.
+
+**Whenever this repo is updated, the extension needs a manual reload to pick it up**: `git pull` in the correct local folder, then click the reload icon (circular arrow) on the extension's card in `chrome://extensions` — no need to Remove/re-add again now that the path is correct.
+
+**Code-session extraction implemented**, using facts gathered by Claude in Chrome directly from a real `claude.ai/code/session_...` conversation (`session_014zcuEkUXw139GVbb15Z95H`, 70+ messages):
+- Rows share `data-perf-row` with chat pages, but with a third value: `"marker"`, used for non-turn divider rows (e.g. "Resumed session") — these are now explicitly skipped rather than mis-tagged.
+- No `[data-testid="user-message"]` exists on Code-session pages at all — user text is in `.epitaxy-user-turn` instead.
+- Assistant text is in one or more `.epitaxy-markdown` blocks, which can be interleaved with collapsed tool-call summary buttons (`button.group/tool`, e.g. "Ran 2 commands, read HANDOFF.md"). `extractAssistantRowText()` now walks both via a combined `querySelectorAll` (document order is preserved automatically) to reconstruct the real sequence, rendering tool summaries as `*[tool] <summary text>*` lines interleaved with the prose.
+- The scroll container is `[data-testid="epitaxy-virtual-transcript"]`, and it does carry `data-autoscroll-container` — but with value `""` (empty string), not `"true"` like on chat pages. `SCROLL_CONTAINER_SELECTOR` was changed from an exact-value match to attribute-presence-only (`[data-autoscroll-container]`), which now correctly matches both surfaces.
+- Virtualization behaves identically to chat (confirmed: full DOM removal on scroll-away, not `display:none`).
+- `CONTENT_SCRIPT_VERSION` bumped to `2026-08-25-v6-code-session-extraction`.
+
+**Verified without live claude.ai access**, same approach as the chat-extraction verification below: a second synthetic fixture (headless Chromium via Playwright, not committed — scratchpad only) mimicking a Code-session virtualizer, including a marker row and assistant rows with interleaved tool-call buttons. The unmodified capture algorithm correctly skipped the marker row, preserved order/roles for all 40 real turns, and correctly reconstructed the tool-call/prose sequence for interleaved rows. Also reran the original chat fixture as a regression check — still 150/150 correct. As before, this validates the *algorithm*, not the real-site selectors directly (though those came from live inspection this time, not guesswork).
+
+**Next step:** real end-to-end test on both a real `claude.ai/chat/...` conversation and a real `claude.ai/code/session_...` conversation — click Export, confirm a file downloads with complete, correctly-ordered, correctly-formatted content on each. The chat path in particular still hasn't had an explicit "yes, the downloaded file was correct" confirmation from the user as of this update — worth checking that first since Code-session support was built on top of the same core capture loop.
+
+---
+
 ## Update (2026-08-25): stale-content-script mystery diagnosed and fixed (code-only, not yet browser-verified)
 
 The session that wrote everything below this line ran with **no live browser access** either, so this fix is reasoned from Chrome extension semantics, not confirmed against the real page. Verify it first (see "Next step" at the end of this section) before trusting anything past it.

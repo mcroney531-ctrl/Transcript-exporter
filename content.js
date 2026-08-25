@@ -9,7 +9,7 @@
   // Bump this string whenever content.js changes. Logged on load and
   // included in diagnostics so a stale/cached injection is obvious
   // instead of silently producing confusing partial results.
-  const CONTENT_SCRIPT_VERSION = "2026-08-25-v5-virtualized-extraction";
+  const CONTENT_SCRIPT_VERSION = "2026-08-25-v6-code-session-extraction";
   console.log("[Claude Conversation Exporter] content.js loaded — version", CONTENT_SCRIPT_VERSION);
 
   // claude.ai is a single-page app: manifest-declared content_scripts only
@@ -201,7 +201,10 @@
   // null — rows are actually removed, not hidden). So extraction has to
   // drive the scroll container from top to bottom, capturing each row as
   // it renders and deduping by its data-index, rather than a single query.
-  const SCROLL_CONTAINER_SELECTOR = '[data-autoscroll-container="true"]';
+  // Value differs by surface — "true" on chat pages, "" (empty string) on
+  // Code session pages ([data-testid="epitaxy-virtual-transcript"]) — so
+  // match on attribute presence only, not a specific value.
+  const SCROLL_CONTAINER_SELECTOR = "[data-autoscroll-container]";
 
   function findScrollContainer(sampleRow) {
     const explicit = document.querySelector(SCROLL_CONTAINER_SELECTOR);
@@ -221,30 +224,38 @@
     return null;
   }
 
-  // A row's role is given directly by data-perf-row ("human"/"assistant")
-  // — confirmed live, and more reliable than inferring from which child
-  // markers are present. Message text lives in different places per role:
-  // user text is inside [data-testid="user-message"]; assistant text is
-  // inside .standard-markdown (or .progressive-markdown while streaming,
-  // which shouldn't apply to a past conversation being exported) under
-  // .font-claude-response. nodeToMarkdown/extractTextFromElement already
-  // handle that inner markup generically (p/pre/ul/ol/etc).
+  // A row's role is given directly by data-perf-row — confirmed live on
+  // both surfaces, and more reliable than inferring from child markup.
+  // Values: "human", "assistant", and (Code sessions only) "marker" for
+  // non-turn divider rows like "Resumed session" — those get skipped.
+  //
+  // Message text location differs by surface:
+  // - Chat: user text in [data-testid="user-message"]; assistant text in
+  //   .standard-markdown (or .progressive-markdown mid-stream) under
+  //   .font-claude-response.
+  // - Code sessions: no [data-testid="user-message"] at all — user text is
+  //   in .epitaxy-user-turn instead. Assistant text is one or more
+  //   .epitaxy-markdown blocks, which can be interleaved with collapsed
+  //   tool-call summaries (button.group/tool, e.g. "Ran 2 commands, read
+  //   HANDOFF.md") — see extractAssistantRowText for how those combine.
   function extractRowMessage(row) {
     const roleAttr = row.getAttribute("data-perf-row");
     let role;
     if (roleAttr === "human") role = "user";
     else if (roleAttr === "assistant") role = "assistant";
-    else return null; // unrecognized row shape — skip rather than mis-tag
+    else return null; // "marker" or unrecognized row shape — not a real turn
 
-    const container =
-      role === "user"
-        ? row.querySelector('[data-testid="user-message"]') || row.querySelector('[data-cds="UserMessage"]')
-        : row.querySelector(".standard-markdown") ||
-          row.querySelector(".progressive-markdown") ||
-          row.querySelector(".font-claude-response");
-    if (!container) return null;
-
-    const text = extractTextFromElement(container);
+    let text;
+    if (role === "user") {
+      const container =
+        row.querySelector('[data-testid="user-message"]') || // chat
+        row.querySelector('[data-cds="UserMessage"]') || // chat
+        row.querySelector(".epitaxy-user-turn"); // Code sessions
+      if (!container) return null;
+      text = extractTextFromElement(container);
+    } else {
+      text = extractAssistantRowText(row);
+    }
     if (!text) return null;
 
     const indexAttr = row.getAttribute("data-index") ?? row.getAttribute("data-rs-index");
@@ -252,6 +263,31 @@
     if (index === null || Number.isNaN(index)) return null;
 
     return { role, text, index };
+  }
+
+  function extractAssistantRowText(row) {
+    const chatContainer =
+      row.querySelector(".standard-markdown") ||
+      row.querySelector(".progressive-markdown") ||
+      row.querySelector(".font-claude-response");
+    if (chatContainer) return extractTextFromElement(chatContainer);
+
+    // Code sessions: prose and tool-call summaries are siblings within the
+    // row. querySelectorAll on a combined selector returns matches in
+    // document order regardless of selector order, so this naturally
+    // reconstructs the real sequence (e.g. tool call, then the response
+    // text that follows it) without a separate sort step.
+    const parts = [];
+    row.querySelectorAll(".epitaxy-markdown, button.group\\/tool").forEach((el) => {
+      if (el.matches(".epitaxy-markdown")) {
+        const t = extractTextFromElement(el);
+        if (t) parts.push(t);
+      } else {
+        const t = el.textContent.trim().replace(/\s+/g, " ");
+        if (t) parts.push(`*[tool] ${t}*`);
+      }
+    });
+    return parts.join("\n\n");
   }
 
   function sleep(ms) {
