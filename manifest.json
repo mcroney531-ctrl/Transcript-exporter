@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Conversation Exporter",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Export the current Claude.ai conversation to a plain text or Markdown file for handoff to a new chat.",
   "permissions": ["activeTab", "scripting", "downloads"],
   "host_permissions": ["https://claude.ai/*"],
