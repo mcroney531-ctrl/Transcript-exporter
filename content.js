@@ -9,7 +9,7 @@
   // Bump this string whenever content.js changes. Logged on load and
   // included in diagnostics so a stale/cached injection is obvious
   // instead of silently producing confusing partial results.
-  const CONTENT_SCRIPT_VERSION = "2026-11-14-v7-stable-turn-keys";
+  const CONTENT_SCRIPT_VERSION = "2026-11-14-v8-position-order";
   console.log("[Claude Conversation Exporter] content.js loaded — version", CONTENT_SCRIPT_VERSION);
 
   // claude.ai is a single-page app: manifest-declared content_scripts only
@@ -271,20 +271,56 @@
     return best || Math.max(150, Math.round(height * 0.5));
   }
 
+  function topRowSignature() {
+    let topRow = null;
+    let topY = Infinity;
+    document.querySelectorAll('[data-testid="transcript-row"]').forEach((row) => {
+      const y = row.getBoundingClientRect().top;
+      if (y < topY) {
+        topY = y;
+        topRow = row;
+      }
+    });
+    if (!topRow) return "";
+    const entry = topRow.querySelector("[data-entry-key]");
+    return entry ? entry.getAttribute("data-entry-key") : topRow.getAttribute("data-index") || "";
+  }
+
+  // Long Code sessions load older history in chunks only once the view
+  // sits at the top, so keep returning to the top until neither the
+  // scroll height nor the first rendered message changes.
+  async function settleAtTop(scrollContainer) {
+    let lastHeight = -1;
+    let lastTop = null;
+    let stableChecks = 0;
+    for (let i = 0; i < 60 && stableChecks < 2; i++) {
+      scrollContainer.scrollTop = 0;
+      await sleep(500);
+      const height = scrollContainer.scrollHeight;
+      const top = topRowSignature();
+      const unchanged = height === lastHeight && top === lastTop && scrollContainer.scrollTop === 0;
+      stableChecks = unchanged ? stableChecks + 1 : 0;
+      lastHeight = height;
+      lastTop = top;
+    }
+  }
+
   async function scrollThrough(scrollContainer, captureVisibleRows, isDone) {
-    scrollContainer.scrollTop = 0;
-    await sleep(250);
+    await settleAtTop(scrollContainer);
     captureVisibleRows();
 
     let lastScrollTop = -1;
     let stableIterations = 0;
-    for (let i = 0; i < 500 && !isDone(); i++) {
+    for (let i = 0; i < 1000 && !isDone(); i++) {
       scrollContainer.scrollTop += nextScrollStep(scrollContainer);
       await sleep(200);
       captureVisibleRows();
 
       if (scrollContainer.scrollTop === lastScrollTop) {
-        if (++stableIterations >= 3) break; // reached the bottom
+        // Give a newer chunk of history time to load before calling it the end.
+        if (++stableIterations >= 3) break;
+        await sleep(400);
+        captureVisibleRows();
       } else {
         stableIterations = 0;
         lastScrollTop = scrollContainer.scrollTop;
@@ -346,14 +382,15 @@
     return { messages, expectedTotal, capturedCount: messages.length, unit: "messages" };
   }
 
-  // Code sessions: data-index is NOT stable (confirmed live). Turns near
-  // the viewport expand into one row per block (tool group or text block)
-  // while distant turns collapse to a single row, so the same block gets a
-  // different data-index depending on scroll position. Stable identity
-  // lives inside the row instead: [data-epitaxy-entry] carries
-  // data-entry-key (per turn), data-epitaxy-entry-index (turn number) and
-  // data-epitaxy-item-index (block number within the turn), and each block
-  // element carries data-item-key. aria-setsize counts turns, not rows.
+  // Code sessions: no number on the page can be trusted for ordering.
+  // data-index shifts as turns expand into one row per block near the
+  // viewport and collapse to one row far from it (confirmed live), and in
+  // long sessions data-epitaxy-entry-index is relative to the chunk of
+  // history currently loaded (a real export merged turns exactly 36
+  // apart). What is stable: data-entry-key on [data-epitaxy-entry] (per
+  // turn) and data-item-key on each block. So blocks are keyed on those,
+  // and ordered by where they sit on screen relative to blocks already
+  // captured.
   function isCodeSessionTranscript() {
     return document.querySelector("[data-epitaxy-entry]") !== null;
   }
@@ -402,69 +439,82 @@
   }
 
   async function captureCodeSessionTranscript(scrollContainer) {
-    const blocks = new Map(); // `${entryKey}|${itemKey}` -> {entryIndex, order, exactOrder, role, text}
+    const blocks = new Map(); // `${entryKey}|${itemKey}` -> {entryKey, role, text}
+    const order = []; // block ids in conversation order
     let expectedTurns = null;
 
-    function captureVisibleRows() {
-      document.querySelectorAll('[data-testid="transcript-row"]').forEach((row) => {
-        const role = rowRole(row);
-        const entry = row.querySelector("[data-epitaxy-entry]");
-        if (!role || !entry) return;
-
-        const entryKey = entry.getAttribute("data-entry-key");
-        const entryIndexAttr = entry.getAttribute("data-epitaxy-entry-index");
-        const entryIndex = entryIndexAttr === null ? NaN : Number(entryIndexAttr);
-        if (!entryKey || Number.isNaN(entryIndex)) return;
-        const itemIndexAttr = entry.getAttribute("data-epitaxy-item-index");
-        const itemIndexNum = Number(itemIndexAttr);
-        const itemIndex = itemIndexAttr && !Number.isNaN(itemIndexNum) ? itemIndexNum : null;
-
-        if (expectedTurns === null) expectedTurns = readSetSize(row);
-
-        const blockEls = outermostMatches(entry, "[data-item-key]");
-        const units = blockEls.length
-          ? blockEls.map((el) => ({ el, key: el.getAttribute("data-item-key") }))
-          : [{ el: entry, key: `row:${itemIndex ?? 0}` }];
-
-        // An expanded row holds exactly one block and its item index gives
-        // that block's exact position in the turn. A collapsed row holds
-        // several, ordered by DOM position until an expanded view of the
-        // same block supplies the exact index.
-        const exactOrder = units.length === 1 && itemIndex !== null;
-        units.forEach(({ el, key }, pos) => {
-          const text = extractCodeSessionBlock(el, key);
-          if (!text) return;
-          const order = exactOrder ? itemIndex : (itemIndex ?? 0) + pos / 1000;
-          const id = `${entryKey}|${key}`;
-          const prev = blocks.get(id);
-          if (!prev) {
-            blocks.set(id, { entryIndex, order, exactOrder, role, text });
+    // Every rendered row sits at its true relative position on screen, so
+    // a snapshot sorted top to bottom is in conversation order. A block
+    // seen for the first time goes right after the nearest earlier block
+    // in the same snapshot that is already placed (or right before the
+    // nearest later one). This also slots in rows the page keeps mounted
+    // far from the viewport, like the last turns.
+    function placeInOrder(snapshotIds) {
+      snapshotIds.forEach((id, i) => {
+        if (order.includes(id)) return;
+        for (let j = i - 1; j >= 0; j--) {
+          const at = order.indexOf(snapshotIds[j]);
+          if (at !== -1) {
+            order.splice(at + 1, 0, id);
             return;
           }
-          if (text.length > prev.text.length) prev.text = text;
-          if (exactOrder && !prev.exactOrder) {
-            prev.order = order;
-            prev.exactOrder = true;
+        }
+        for (let j = i + 1; j < snapshotIds.length; j++) {
+          const at = order.indexOf(snapshotIds[j]);
+          if (at !== -1) {
+            order.splice(at, 0, id);
+            return;
           }
-        });
+        }
+        order.push(id);
       });
     }
 
-    const turnsSeen = () => new Set(Array.from(blocks.values(), (b) => b.entryIndex)).size;
-    for (let pass = 0; pass < 3; pass++) {
+    function captureVisibleRows() {
+      const units = [];
+      document.querySelectorAll('[data-testid="transcript-row"]').forEach((row) => {
+        const role = rowRole(row);
+        const entry = row.querySelector("[data-epitaxy-entry]");
+        const entryKey = entry && entry.getAttribute("data-entry-key");
+        if (!role || !entryKey) return;
+
+        if (expectedTurns === null) expectedTurns = readSetSize(row);
+
+        const y = row.getBoundingClientRect().top;
+        const blockEls = outermostMatches(entry, "[data-item-key]");
+        const parts = blockEls.length
+          ? blockEls.map((el) => ({ el, key: el.getAttribute("data-item-key") }))
+          : [{ el: entry, key: `row:${entry.getAttribute("data-epitaxy-item-index") || 0}` }];
+        parts.forEach(({ el, key }, pos) => units.push({ y, pos, el, key, entryKey, role }));
+      });
+      units.sort((a, b) => a.y - b.y || a.pos - b.pos);
+
+      const snapshotIds = [];
+      units.forEach(({ el, key, entryKey, role }) => {
+        const text = extractCodeSessionBlock(el, key);
+        if (!text) return;
+        const id = `${entryKey}|${key}`;
+        const prev = blocks.get(id);
+        if (!prev) blocks.set(id, { entryKey, role, text });
+        else if (text.length > prev.text.length) prev.text = text;
+        snapshotIds.push(id);
+      });
+      placeInOrder(snapshotIds);
+    }
+
+    const turnsSeen = () => new Set(Array.from(blocks.values(), (b) => b.entryKey)).size;
+    for (let pass = 0; pass < 2; pass++) {
       await scrollThrough(scrollContainer, captureVisibleRows, () => false);
       if (expectedTurns === null || turnsSeen() >= expectedTurns) break;
     }
 
-    const sorted = Array.from(blocks.values()).sort(
-      (a, b) => a.entryIndex - b.entryIndex || a.order - b.order
-    );
     const turns = [];
-    for (const b of sorted) {
+    order.forEach((id) => {
+      const b = blocks.get(id);
       const last = turns[turns.length - 1];
-      if (last && last.entryIndex === b.entryIndex) last.text += "\n\n" + b.text;
-      else turns.push({ entryIndex: b.entryIndex, role: b.role, text: b.text });
-    }
+      if (last && last.entryKey === b.entryKey) last.text += "\n\n" + b.text;
+      else turns.push({ entryKey: b.entryKey, role: b.role, text: b.text });
+    });
 
     const messages = turns.map(({ role, text }) => ({ role, text }));
     return { messages, expectedTotal: expectedTurns, capturedCount: messages.length, unit: "turns" };

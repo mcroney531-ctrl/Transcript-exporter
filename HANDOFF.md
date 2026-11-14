@@ -2,6 +2,18 @@
 
 Read this whole document into a fresh Claude Code session before continuing. It captures everything needed to pick this up cold: the goal, what's built, what's broken, and the exact next steps — no need to re-derive any of it.
 
+## Update (2026-11-14, later): Code-session order no longer uses any page numbers
+
+The v7 rewrite below fixed code blocks, tool lines and hidden text on a real export, but the order was scrambled and the first turns were missing. The scrambling had a precise pattern: turns exactly 36 apart were merged into one section ("can you help me cd" next to an August reply). So `data-epitaxy-entry-index` is not stable either in a long session. It appears to count turns within the chunk of history currently loaded, and the page seems to load older chunks only while the view sits at the top. That would explain the missing start. This is inferred from the export, not inspected live; Claude in Chrome's earlier check ran when the session had only 43 turns.
+
+**What changed** (`CONTENT_SCRIPT_VERSION` `2026-11-14-v8-position-order`, manifest `1.4.0`):
+- `captureCodeSessionTranscript()` reads no turn or item numbers at all. Each capture sorts the rendered blocks by their on-screen position. A block seen for the first time goes right after the nearest block from the same capture that is already placed. Turns are grouped by `data-entry-key`.
+- `scrollThrough()` first runs `settleAtTop()`: it returns to the top every 0.5s until neither the scroll height nor the first rendered message changes, so older chunks finish loading. At the bottom, it waits a little longer before deciding there's nothing more to load.
+
+**Verified** against a third test page (scratchpad only) that models chunked history: 60 turns with only 24 loaded at a time, the session opening at the bottom, older chunks loading 0.3s after reaching the top, the far end unloading, and turn numbers relative to the loaded chunk. The new version captured all 60 turns in order. v7 captured 17, with merged turns and a missing start, matching the real failure. The chat page (150/150) and the v7 Code-session page (30/30) still pass.
+
+**Next step:** export this session again from the real page and check that it starts with "migrating from another account", runs in order, and ends with the latest turn.
+
 ## Update (2026-11-14): Code-session export rebuilt around stable turn IDs
 
 Real exports of two long Code sessions kept the start and the last few rows but dropped everything in the middle, lost all code blocks, and leaked hidden text. Claude in Chrome inspected a live session (this one) and found why. The Code-session layout has changed since the August notes further down, so treat those as superseded:
