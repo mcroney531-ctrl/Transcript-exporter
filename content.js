@@ -9,7 +9,7 @@
   // Bump this string whenever content.js changes. Logged on load and
   // included in diagnostics so a stale/cached injection is obvious
   // instead of silently producing confusing partial results.
-  const CONTENT_SCRIPT_VERSION = "2026-08-25-v6-code-session-extraction";
+  const CONTENT_SCRIPT_VERSION = "2026-11-14-v7-stable-turn-keys";
   console.log("[Claude Conversation Exporter] content.js loaded — version", CONTENT_SCRIPT_VERSION);
 
   // claude.ai is a single-page app: manifest-declared content_scripts only
@@ -98,6 +98,17 @@
     return null;
   }
 
+  // Screen-reader-only text ("Claude responded: ..." / "You said: ..."
+  // headings, live-region status spans) duplicates visible content, and
+  // message toolbars hold UI chrome like timestamps. Neither belongs in
+  // an export.
+  function isHiddenOrChrome(el) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === "script" || tag === "style" || tag === "svg" || tag === "button") return true;
+    if (el.classList.contains("sr-only") || el.classList.contains("visually-hidden")) return true;
+    return el.getAttribute("role") === "toolbar";
+  }
+
   // Recursively walk a message's DOM subtree, converting it into
   // reasonably clean Markdown-flavored text. Falls back to plain text
   // for anything it doesn't specifically handle.
@@ -105,8 +116,15 @@
     if (node.nodeType === Node.TEXT_NODE) {
       return node.textContent;
     }
-    if (node.nodeType !== Node.ELEMENT_NODE) {
+    if (node.nodeType !== Node.ELEMENT_NODE || isHiddenOrChrome(node)) {
       return "";
+    }
+
+    // Code-session code blocks render inside a shadow root, which the DOM
+    // walk can't see; the clean source text is mirrored on this attribute.
+    const codeText = node.getAttribute("data-code-text");
+    if (codeText !== null) {
+      return "```\n" + codeText.replace(/\n+$/, "") + "\n```\n\n";
     }
 
     const tag = node.tagName.toLowerCase();
@@ -174,11 +192,6 @@
       }
       case "hr":
         return "\n---\n\n";
-      case "script":
-      case "style":
-      case "svg":
-      case "button":
-        return "";
       default:
         return childText();
     }
@@ -200,8 +213,10 @@
   // re-querying a mid-thread data-index after scrolling away returned
   // null — rows are actually removed, not hidden). So extraction has to
   // drive the scroll container from top to bottom, capturing each row as
-  // it renders and deduping by its data-index, rather than a single query.
-  // Value differs by surface — "true" on chat pages, "" (empty string) on
+  // it renders, rather than a single query. How rows are deduped differs by
+  // surface — see captureChatTranscript / captureCodeSessionTranscript.
+  //
+  // data-autoscroll-container's value differs by surface — "true" on chat pages, "" (empty string) on
   // Code session pages ([data-testid="epitaxy-virtual-transcript"]) — so
   // match on attribute presence only, not a specific value.
   const SCROLL_CONTAINER_SELECTOR = "[data-autoscroll-container]";
@@ -224,74 +239,235 @@
     return null;
   }
 
-  // A row's role is given directly by data-perf-row — confirmed live on
-  // both surfaces, and more reliable than inferring from child markup.
-  // Values: "human", "assistant", and (Code sessions only) "marker" for
-  // non-turn divider rows like "Resumed session" — those get skipped.
-  //
-  // Message text location differs by surface:
-  // - Chat: user text in [data-testid="user-message"]; assistant text in
-  //   .standard-markdown (or .progressive-markdown mid-stream) under
-  //   .font-claude-response.
-  // - Code sessions: no [data-testid="user-message"] at all — user text is
-  //   in .epitaxy-user-turn instead. Assistant text is one or more
-  //   .epitaxy-markdown blocks, which can be interleaved with collapsed
-  //   tool-call summaries (button.group/tool, e.g. "Ran 2 commands, read
-  //   HANDOFF.md") — see extractAssistantRowText for how those combine.
-  function extractRowMessage(row) {
-    const roleAttr = row.getAttribute("data-perf-row");
-    let role;
-    if (roleAttr === "human") role = "user";
-    else if (roleAttr === "assistant") role = "assistant";
-    else return null; // "marker" or unrecognized row shape — not a real turn
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
 
-    let text;
-    if (role === "user") {
-      const container =
-        row.querySelector('[data-testid="user-message"]') || // chat
-        row.querySelector('[data-cds="UserMessage"]') || // chat
-        row.querySelector(".epitaxy-user-turn"); // Code sessions
-      if (!container) return null;
-      text = extractTextFromElement(container);
-    } else {
-      text = extractAssistantRowText(row);
+  function rowRole(row) {
+    const roleAttr = row.getAttribute("data-perf-row");
+    if (roleAttr === "human") return "user";
+    if (roleAttr === "assistant") return "assistant";
+    return null; // e.g. "marker" divider rows — not a real turn
+  }
+
+  function readSetSize(row) {
+    const article = row.querySelector("[aria-setsize]");
+    const n = article ? Number(article.getAttribute("aria-setsize")) : NaN;
+    return Number.isNaN(n) || n <= 0 ? null : n;
+  }
+
+  // Each step lands the last row that starts inside the viewport at its
+  // top edge, so every row passes through view no matter how row heights
+  // change as rows render and get measured. Falls back to half a viewport
+  // when one row fills the whole view.
+  function nextScrollStep(scrollContainer) {
+    const top = scrollContainer.getBoundingClientRect().top;
+    const height = scrollContainer.clientHeight;
+    let best = 0;
+    document.querySelectorAll('[data-testid="transcript-row"]').forEach((row) => {
+      const offset = row.getBoundingClientRect().top - top;
+      if (offset > 40 && offset < height - 1 && offset > best) best = offset;
+    });
+    return best || Math.max(150, Math.round(height * 0.5));
+  }
+
+  async function scrollThrough(scrollContainer, captureVisibleRows, isDone) {
+    scrollContainer.scrollTop = 0;
+    await sleep(250);
+    captureVisibleRows();
+
+    let lastScrollTop = -1;
+    let stableIterations = 0;
+    for (let i = 0; i < 500 && !isDone(); i++) {
+      scrollContainer.scrollTop += nextScrollStep(scrollContainer);
+      await sleep(200);
+      captureVisibleRows();
+
+      if (scrollContainer.scrollTop === lastScrollTop) {
+        if (++stableIterations >= 3) break; // reached the bottom
+      } else {
+        stableIterations = 0;
+        lastScrollTop = scrollContainer.scrollTop;
+      }
     }
+
+    scrollContainer.scrollTop = scrollContainer.scrollHeight;
+    await sleep(250);
+    captureVisibleRows();
+  }
+
+  // Chat pages: one row per message, and data-index is stable, so rows are
+  // deduped by it. User text is in [data-testid="user-message"]; assistant
+  // text in .standard-markdown (or .progressive-markdown mid-stream) under
+  // .font-claude-response.
+  function extractChatRowMessage(row) {
+    const role = rowRole(row);
+    if (!role) return null;
+
+    const container =
+      role === "user"
+        ? row.querySelector('[data-testid="user-message"]') || row.querySelector('[data-cds="UserMessage"]')
+        : row.querySelector(".standard-markdown") ||
+          row.querySelector(".progressive-markdown") ||
+          row.querySelector(".font-claude-response");
+    if (!container) return null;
+
+    const text = extractTextFromElement(container);
     if (!text) return null;
 
     const indexAttr = row.getAttribute("data-index") ?? row.getAttribute("data-rs-index");
-    const index = indexAttr !== null ? Number(indexAttr) : null;
-    if (index === null || Number.isNaN(index)) return null;
+    const index = indexAttr !== null ? Number(indexAttr) : NaN;
+    if (Number.isNaN(index)) return null;
 
     return { role, text, index };
   }
 
-  function extractAssistantRowText(row) {
-    const chatContainer =
-      row.querySelector(".standard-markdown") ||
-      row.querySelector(".progressive-markdown") ||
-      row.querySelector(".font-claude-response");
-    if (chatContainer) return extractTextFromElement(chatContainer);
+  async function captureChatTranscript(scrollContainer) {
+    const captured = new Map(); // data-index -> {role, text, index}
+    let expectedTotal = null;
 
-    // Code sessions: prose and tool-call summaries are siblings within the
-    // row. querySelectorAll on a combined selector returns matches in
-    // document order regardless of selector order, so this naturally
-    // reconstructs the real sequence (e.g. tool call, then the response
-    // text that follows it) without a separate sort step.
-    const parts = [];
-    row.querySelectorAll(".epitaxy-markdown, button.group\\/tool").forEach((el) => {
-      if (el.matches(".epitaxy-markdown")) {
-        const t = extractTextFromElement(el);
-        if (t) parts.push(t);
-      } else {
-        const t = el.textContent.trim().replace(/\s+/g, " ");
-        if (t) parts.push(`*[tool] ${t}*`);
-      }
-    });
-    return parts.join("\n\n");
+    function captureVisibleRows() {
+      document.querySelectorAll('[data-testid="transcript-row"]').forEach((row) => {
+        if (expectedTotal === null) expectedTotal = readSetSize(row);
+        const msg = extractChatRowMessage(row);
+        if (msg && !captured.has(msg.index)) captured.set(msg.index, msg);
+      });
+    }
+
+    await scrollThrough(
+      scrollContainer,
+      captureVisibleRows,
+      () => expectedTotal !== null && captured.size >= expectedTotal
+    );
+
+    const messages = Array.from(captured.values())
+      .sort((a, b) => a.index - b.index)
+      .map(({ role, text }) => ({ role, text }));
+    return { messages, expectedTotal, capturedCount: messages.length, unit: "messages" };
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  // Code sessions: data-index is NOT stable (confirmed live). Turns near
+  // the viewport expand into one row per block (tool group or text block)
+  // while distant turns collapse to a single row, so the same block gets a
+  // different data-index depending on scroll position. Stable identity
+  // lives inside the row instead: [data-epitaxy-entry] carries
+  // data-entry-key (per turn), data-epitaxy-entry-index (turn number) and
+  // data-epitaxy-item-index (block number within the turn), and each block
+  // element carries data-item-key. aria-setsize counts turns, not rows.
+  function isCodeSessionTranscript() {
+    return document.querySelector("[data-epitaxy-entry]") !== null;
+  }
+
+  function outermostMatches(root, selector) {
+    return Array.from(root.querySelectorAll(selector)).filter((el) => {
+      const outer = el.parentElement && el.parentElement.closest(selector);
+      return !outer || !root.contains(outer);
+    });
+  }
+
+  // Tool summary labels are split across inline spans ("Edited",
+  // "content.js", "+34", "−1"), so join text nodes with spaces rather than
+  // concatenating them.
+  function visibleTextJoined(el) {
+    const parts = [];
+    const walk = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const t = node.textContent.trim();
+        if (t) parts.push(t);
+      } else if (node.nodeType === Node.ELEMENT_NODE && !isHiddenOrChrome(node)) {
+        node.childNodes.forEach(walk);
+      }
+    };
+    walk(el);
+    return parts.join(" ").replace(/\s+/g, " ").replace(/ ([,.;:])/g, "$1").trim();
+  }
+
+  // A tool group ([data-cds="TurnStatus"]) holds its one-line summary in a
+  // label the row's toggle button points at via aria-labelledby; reading
+  // only that label keeps expanded tool output out of the export.
+  function toolSummaryText(el) {
+    const toggle = el.querySelector("[aria-labelledby]");
+    const labelId = toggle && toggle.getAttribute("aria-labelledby").split(/\s+/)[0];
+    let label = labelId ? document.getElementById(labelId) : null;
+    if (!label || !el.contains(label)) label = el;
+    return visibleTextJoined(label.querySelector('[data-cds-phrases="all"]') || label);
+  }
+
+  function extractCodeSessionBlock(el, key) {
+    if (el.matches('[data-cds="TurnStatus"]') || key.includes(":grp:")) {
+      const summary = toolSummaryText(el);
+      return summary ? `*[tool] ${summary}*` : "";
+    }
+    return extractTextFromElement(el);
+  }
+
+  async function captureCodeSessionTranscript(scrollContainer) {
+    const blocks = new Map(); // `${entryKey}|${itemKey}` -> {entryIndex, order, exactOrder, role, text}
+    let expectedTurns = null;
+
+    function captureVisibleRows() {
+      document.querySelectorAll('[data-testid="transcript-row"]').forEach((row) => {
+        const role = rowRole(row);
+        const entry = row.querySelector("[data-epitaxy-entry]");
+        if (!role || !entry) return;
+
+        const entryKey = entry.getAttribute("data-entry-key");
+        const entryIndexAttr = entry.getAttribute("data-epitaxy-entry-index");
+        const entryIndex = entryIndexAttr === null ? NaN : Number(entryIndexAttr);
+        if (!entryKey || Number.isNaN(entryIndex)) return;
+        const itemIndexAttr = entry.getAttribute("data-epitaxy-item-index");
+        const itemIndexNum = Number(itemIndexAttr);
+        const itemIndex = itemIndexAttr && !Number.isNaN(itemIndexNum) ? itemIndexNum : null;
+
+        if (expectedTurns === null) expectedTurns = readSetSize(row);
+
+        const blockEls = outermostMatches(entry, "[data-item-key]");
+        const units = blockEls.length
+          ? blockEls.map((el) => ({ el, key: el.getAttribute("data-item-key") }))
+          : [{ el: entry, key: `row:${itemIndex ?? 0}` }];
+
+        // An expanded row holds exactly one block and its item index gives
+        // that block's exact position in the turn. A collapsed row holds
+        // several, ordered by DOM position until an expanded view of the
+        // same block supplies the exact index.
+        const exactOrder = units.length === 1 && itemIndex !== null;
+        units.forEach(({ el, key }, pos) => {
+          const text = extractCodeSessionBlock(el, key);
+          if (!text) return;
+          const order = exactOrder ? itemIndex : (itemIndex ?? 0) + pos / 1000;
+          const id = `${entryKey}|${key}`;
+          const prev = blocks.get(id);
+          if (!prev) {
+            blocks.set(id, { entryIndex, order, exactOrder, role, text });
+            return;
+          }
+          if (text.length > prev.text.length) prev.text = text;
+          if (exactOrder && !prev.exactOrder) {
+            prev.order = order;
+            prev.exactOrder = true;
+          }
+        });
+      });
+    }
+
+    const turnsSeen = () => new Set(Array.from(blocks.values(), (b) => b.entryIndex)).size;
+    for (let pass = 0; pass < 3; pass++) {
+      await scrollThrough(scrollContainer, captureVisibleRows, () => false);
+      if (expectedTurns === null || turnsSeen() >= expectedTurns) break;
+    }
+
+    const sorted = Array.from(blocks.values()).sort(
+      (a, b) => a.entryIndex - b.entryIndex || a.order - b.order
+    );
+    const turns = [];
+    for (const b of sorted) {
+      const last = turns[turns.length - 1];
+      if (last && last.entryIndex === b.entryIndex) last.text += "\n\n" + b.text;
+      else turns.push({ entryIndex: b.entryIndex, role: b.role, text: b.text });
+    }
+
+    const messages = turns.map(({ role, text }) => ({ role, text }));
+    return { messages, expectedTotal: expectedTurns, capturedCount: messages.length, unit: "turns" };
   }
 
   async function captureVirtualizedTranscript() {
@@ -302,65 +478,14 @@
     }
 
     const originalScrollTop = scrollContainer.scrollTop;
-    const captured = new Map(); // data-index -> {role, text, index}
-    let expectedTotal = null;
-
-    function captureVisibleRows() {
-      document.querySelectorAll('[data-testid="transcript-row"]').forEach((row) => {
-        if (expectedTotal === null) {
-          const article = row.querySelector("[aria-setsize]");
-          if (article) {
-            const setSize = Number(article.getAttribute("aria-setsize"));
-            if (!Number.isNaN(setSize)) expectedTotal = setSize;
-          }
-        }
-        const msg = extractRowMessage(row);
-        if (!msg || captured.has(msg.index)) return;
-        captured.set(msg.index, msg);
-      });
+    try {
+      const result = isCodeSessionTranscript()
+        ? await captureCodeSessionTranscript(scrollContainer)
+        : await captureChatTranscript(scrollContainer);
+      return { success: true, ...result };
+    } finally {
+      scrollContainer.scrollTop = originalScrollTop;
     }
-
-    scrollContainer.scrollTop = 0;
-    await sleep(200);
-    captureVisibleRows();
-
-    // Deliberately smaller than a full viewport so consecutive capture
-    // windows overlap — avoids skipping rows the virtualizer never
-    // rendered because a step jumped clean over them.
-    const stepSize = Math.max(150, Math.round(scrollContainer.clientHeight * 0.5));
-    let lastScrollTop = -1;
-    let stableIterations = 0;
-    const maxIterations = 300;
-
-    for (let i = 0; i < maxIterations; i++) {
-      if (expectedTotal !== null && captured.size >= expectedTotal) break;
-
-      scrollContainer.scrollTop += stepSize;
-      await sleep(150);
-      captureVisibleRows();
-
-      if (scrollContainer.scrollTop === lastScrollTop) {
-        stableIterations++;
-        if (stableIterations >= 3) break; // reached the bottom
-      } else {
-        stableIterations = 0;
-        lastScrollTop = scrollContainer.scrollTop;
-      }
-    }
-
-    // One more explicit pass pinned to the very bottom, in case the
-    // stepping loop overshot and stopped just short of it.
-    scrollContainer.scrollTop = scrollContainer.scrollHeight;
-    await sleep(200);
-    captureVisibleRows();
-
-    scrollContainer.scrollTop = originalScrollTop;
-
-    const messages = Array.from(captured.values())
-      .sort((a, b) => a.index - b.index)
-      .map(({ role, text }) => ({ role, text }));
-
-    return { success: true, messages, expectedTotal, capturedCount: messages.length };
   }
 
   async function extractConversation() {
@@ -376,8 +501,8 @@
 
       const countNote =
         captureResult.expectedTotal != null
-          ? ` (captured ${captureResult.capturedCount} of ${captureResult.expectedTotal})`
-          : ` (captured ${captureResult.capturedCount})`;
+          ? ` (captured ${captureResult.capturedCount} of ${captureResult.expectedTotal} ${captureResult.unit})`
+          : ` (captured ${captureResult.capturedCount} ${captureResult.unit})`;
 
       return {
         success: true,

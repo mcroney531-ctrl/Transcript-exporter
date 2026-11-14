@@ -2,6 +2,27 @@
 
 Read this whole document into a fresh Claude Code session before continuing. It captures everything needed to pick this up cold: the goal, what's built, what's broken, and the exact next steps — no need to re-derive any of it.
 
+## Update (2026-11-14): Code-session export rebuilt around stable turn IDs
+
+Real exports of two long Code sessions kept the start and the last few rows but dropped everything in the middle, lost all code blocks, and leaked hidden text. Claude in Chrome inspected a live session (this one) and found why. The Code-session layout has changed since the August notes further down, so treat those as superseded:
+
+- **`data-index` is not stable in Code sessions.** Turns near the viewport expand into one row per block (tool group or text block), and distant turns collapse to a single row. So the same message gets a different `data-index` depending on scroll position: one turn read 80, 65, 43 and 96 on different passes. Deduping by index therefore skipped real rows as "already captured". (Chat pages are unaffected; their index is stable and that path is unchanged.)
+- **Stable IDs live inside each row**, on `[data-epitaxy-entry]`: `data-entry-key` (per turn: a UUID for user turns, `msg_…` for assistant turns), `data-epitaxy-entry-index` (turn number), and `data-epitaxy-item-index` (block number within the turn; absent on user rows). Each block element carries `data-item-key` (`msg_…:grp:toolu_…` for tool groups, `msg_…:tNNNN` for text). `aria-setsize` on `[role=article]` counts turns, not rows.
+- **Tool groups** are `[data-cds="TurnStatus"]`. The summary ("Ran 3 commands") is a `<bdi>` inside a label span that the row's chevron `<button>` points at via `aria-labelledby`. A hidden `span.sr-only[role=status]` sits beside it.
+- **Code blocks** render inside an open shadow root on `<diffs-container>`, so a DOM walk sees nothing. The clean source is in `data-code-text` on `.epitaxy-diff`.
+- **Hidden headings** ("Claude responded: …", "You said: …") are `h3.sr-only` in the first row of each turn. The "Aug 24" date is a `<time>` inside the user message's `[role=toolbar]` action bar.
+- No lazy loading of older history: the whole conversation is in the virtualizer. `.epitaxy-markdown` and `.epitaxy-user-turn` no longer exist.
+
+**What changed in `content.js`** (`CONTENT_SCRIPT_VERSION` `2026-11-14-v7-stable-turn-keys`, manifest `1.3.0`):
+- Code sessions (detected by `[data-epitaxy-entry]`) use `captureCodeSessionTranscript()`. It keys each block on `data-entry-key` + `data-item-key`, orders blocks by turn number and then item index, and joins each turn's blocks into one message. The export now has one `### Claude` section per turn instead of one per tool call. If any turn is missing after a pass (checked against `aria-setsize`), it runs another pass, up to 3 in total.
+- Tool groups export as `*[tool] <summary>*`, read from the label only, so expanded tool output stays out.
+- `nodeToMarkdown()` now skips `.sr-only`/`.visually-hidden` elements and `[role=toolbar]`, and turns any element with `data-code-text` into a fenced code block. This applies to chat pages too, where the same hidden "Claude responded:" headings had been leaking into exports.
+- Both surfaces now scroll by landing the last row that starts inside the viewport at the top edge, instead of a fixed half-viewport step, so rows that change height as they render can't cause a skip.
+
+**Verified** in headless Chromium against two test pages (scratchpad only, not committed). On the chat page, all 150 messages came out correct. The Code-session page mimics the live findings: renumbering rows, expand/collapse, `sr-only` headings, `TurnStatus` tool groups with one expanded, code inside a shadow root, and a toolbar date. All 30 turns came out with exact text. The previous version failed the same Code-session page the way the real exports did.
+
+**Next step:** export this session, or any long Code session, from the real page and check that the middle is present, code blocks appear, and there are no "Claude responded:"/"You said:"/date artifacts.
+
 ## Update (2026-08-25, latest): real root cause of the stale-code mystery found, and Code-session extraction implemented
 
 Two things resolved since the sections below were written, most recent first:
