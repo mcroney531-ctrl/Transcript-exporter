@@ -12,7 +12,13 @@ The v7 rewrite below fixed code blocks, tool lines and hidden text on a real exp
 
 **Verified** against a third test page (scratchpad only) that models chunked history: 60 turns with only 24 loaded at a time, the session opening at the bottom, older chunks loading 0.3s after reaching the top, the far end unloading, and turn numbers relative to the loaded chunk. The new version captured all 60 turns in order. v7 captured 17, with merged turns and a missing start, matching the real failure. The chat page (150/150) and the v7 Code-session page (30/30) still pass.
 
-**Next step:** export this session again from the real page and check that it starts with "migrating from another account", runs in order, and ends with the latest turn.
+**Confirmed on the real page (v1.4.0):** a full export of this session started with "migrating from another account", kept every turn in order, and ended with the latest reply. Code blocks in assistant replies, `*[tool] …*` lines and hidden-text removal all held up. Remaining gaps, all in **user** messages:
+- Code blocks inside user messages are dropped, though the text around them survives. User bubbles must render code differently from assistant replies (not yet inspected).
+- Very long user messages are cut off by the page itself: the bubble ends with "N more characters aren't shown. Copy the message to get all of it." The rest isn't on the page. Possibly a "Show more" click expands it.
+- Screenshot-only user messages produce no text and are skipped.
+- Attachment chips export as glued text, e.g. `…2026-10-10.txtTXT`.
+
+**Next step:** ask Claude in Chrome how user-message code blocks, the "Show more"/truncation notice, attachment chips and screenshot-only messages are built, then fix them.
 
 ## Update (2026-11-14): Code-session export rebuilt around stable turn IDs
 
